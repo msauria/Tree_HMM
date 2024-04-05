@@ -420,16 +420,16 @@ class EmissionGaussianDistribution(EmissionContinuousDistribution):
         return
 
     def score_observations(self, obs, **kwargs):
-        start = kwargs['start']
-        end = kwargs['end']
+        # start = kwargs['start']
+        # end = kwargs['end']
         # prob = (self.log_pdf_constant - self.logsigma - 0.5 *
         #         ((obs[start:end] - self.mu) / self.sigma) ** 2)
-        prob = scipy.stats.norm.logpdf(obs[start:end], self.mu, self.sigma)
+        prob = scipy.stats.norm.logpdf(obs, self.mu, self.sigma)
         return prob
 
     @classmethod
     def update_tallies(self, *args):
-        (func, start, end, nodel_name, node_idx, state_idx, dist_idx, mix_idx,
+        (func, start, end, node_name, node_idx, state_idx, dist_idx, mix_idx,
          obsDtype, params, smm_map) = args
         views = []
         views.append(SharedMemory(smm_map['sizes']))

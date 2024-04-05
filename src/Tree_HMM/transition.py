@@ -68,19 +68,19 @@ class TransitionMatrix():
                               buffer=views[-1].buf)
         tallies = numpy.zeros((num_states, num_states), numpy.float64)
         for idx1, idx2 in pairs:
-            children = node_children[idx2]
+            children = node_children[idx1]
             if len(children) == 0:
-                tmpreverse = probs[s:e, :, idx2] - scale[s:e, idx2]
+                tmpreverse = probs[s:e, :, idx1] - scale[s:e, idx1].reshape(-1, 1)
             elif len(children) == 1:
-                tmpreverse = (probs[s:e, :, idx2] - scale[s:e, idx2] +
+                tmpreverse = (probs[s:e, :, idx1] - scale[s:e, idx1].reshape(-1, 1) +
                               reverse[s:e, :, children[0]])
             else:
-                tmpreverse = (probs[s:e, :, idx2] - scale[s:e, idx2].reshape(-1, 1) +
+                tmpreverse = (probs[s:e, :, idx1] - scale[s:e, idx1].reshape(-1, 1) +
                               numpy.sum(reverse[s:e, :, children], axis=2))
-            xi = (forward[s:e, :, idx1].reshape(-1, num_states, 1) +
+            xi = (forward[s:e, :, idx2].reshape(-1, num_states, 1) +
                   tmpreverse.reshape(-1, 1, num_states) +
                   transitions.reshape(1, num_states, num_states))
-            xi -= numpy.amax(xi.reshape(e - s, -1), axis=1, keepdims=True)
+            xi -= numpy.amax(xi.reshape(e - s, -1), axis=1).reshape(-1, 1, 1)
             xi = numpy.exp(xi)
             xi /= numpy.sum(numpy.sum(xi, axis=2), axis=1).reshape(-1, 1, 1)
             tallies += numpy.sum(xi, axis=0)

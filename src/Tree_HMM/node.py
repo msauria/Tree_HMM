@@ -74,8 +74,6 @@ class Node():
             self.states.append(State(E, h))
             if state_names is not None and h < len(state_names):
                 self.states[-1].label = state_names[h]
-            else:
-                raise RuntimeError("emissions must be None, an Emission instance, or a list of Emission instances")
         return
 
     def find_levels(self, level=0):
@@ -111,9 +109,9 @@ class Node():
         num_nodes, num_dists, num_states, num_seqs = sizes
         RNG = numpy.random.default_rng(seed)
         views.append(SharedMemory(smm_map['obs']))
-        obs = numpy.ndarray((num_seqs,), hmm.get_emission_dtype(), buffer=views[-1].buf)
+        obs = numpy.ndarray((num_seqs, num_nodes), obs_dtype, buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['obs_states']))
-        states = numpy.ndarray((obsN,), numpy.int32, buffer=views[-1].buf)
+        states = numpy.ndarray((num_seqs, num_nodes,), numpy.int32, buffer=views[-1].buf)
         initprobs = numpy.cumsum(initprobs)
         for i in range(start, end):
             states[i, root.index] = numpy.searchsorted(initprobs, RNG.random())
@@ -126,7 +124,7 @@ class Node():
         state = states[self.index]        
         obs[self.index] = self.states[state].generate_sequence(RNG)
         for C in self.children:
-            states[self.C.index] = transitions.generate_transition(state, RNG)
+            states[C.index] = transitions.generate_transition(state, RNG)
             C.generate_sequence(states, obs, transitions, RNG)
         return
 
@@ -140,7 +138,6 @@ class Node():
         for i in range(self.num_states):
             params.append(self.states[i].get_parameters())
         return params
-    args.append((s, e, self.obs[0].dtype, self.smm_map))
 
     @classmethod
     def find_paths(self, *args):
@@ -153,28 +150,36 @@ class Node():
         views.append(SharedMemory(smm_map['probs']))
         probs = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                               buffer=views[-1].buf)
+        views.append(SharedMemory(smm_map['reverse']))
+        reverse = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
+                              buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['obs_states']))
         states = numpy.ndarray((num_seqs, num_nodes), dtype=numpy.int32,
                                buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['obs_scores']))
+        scores = numpy.ndarray((num_seqs, 2), dtype=numpy.float64,
+                               buffer=views[-1].buf)
         root_idx = node_order[0]
         for i in range(start, end):
             path = numpy.zeros((num_states, num_nodes), numpy.int32)
+            all_scores = numpy.zeros((num_states, num_states, num_nodes), numpy.float64)
             for j in node_order[::-1]:
                 children_idxs = node_children[j]
-                if len(children_idxs) > 0:
-                    tmp = (probs[i, :, children_idxs].reshape(1, num_states, -1) +
-                           transitions.reshape(num_states, num_states, 1))
-                    best = numpy.argmax(tmp, axis=1)
-                    path[:, children_idxs] = best
-                    probs[i, :, j] += (probs[i, best, children_idxs] +
-                                       transitions[numpy.arange(num_states), best])
-            probs[i, :, root_idx] += initprobs
-            best = numpy.argmax(probs[i, :, root_idx])
-            obs_states[i, root_idx] = best
-            obs_scores[i, 0] = probs[i, best, root_idx]
+                reverse[i, :, j] = numpy.copy(probs[i, :, j])
+                for idx in children_idxs:
+                    best = numpy.argmax(all_scores[:, :, idx], axis=1)
+                    path[:, idx] = best
+                    reverse[i, :, j] += all_scores[numpy.arange(num_states), best, idx]
+                if j != node_order[0]:
+                    all_scores[:, :, j] = reverse[i:i+1, :, j] + transitions
+                else:
+                    reverse[i, :, j] += initprobs
+                    all_scores[:, :, j] = reverse[i:i+1, :, j]
+            best = numpy.argmax(reverse[i, :, root_idx])
+            states[i, root_idx] = best
+            scores[i, 0] = reverse[i, best, root_idx]
             for j in node_order[1:]:
-                obs_states[i, j] = path[obs_states[i, node_parents[j]], j]
+                states[i, j] = path[states[i, node_parents[j]], j]
         for V in views:
             V.close()
         return
@@ -247,6 +252,7 @@ class Node():
         views.append(SharedMemory(smm_map['scale']))
         scale = numpy.ndarray((num_seqs, num_nodes), numpy.float64,
                               buffer=views[-1].buf)
+        reverse[start:end, :, node_order[0]] = 0
         for i in node_order[1:][::-1]:
             children_idxs = node_children[i]
             if len(children_idxs) > 0:
@@ -293,21 +299,21 @@ class Node():
                 scale[start:end, i] = scipy.special.logsumexp(
                     forward[start:end, :, i], axis=1)
                 forward[start:end, :, i] -= scale[start:end, i].reshape(-1, 1)
-            elif len(node_children[parent_idx]) == 1:
-                forward[start:end, :, i] = (scipy.special.logsumexp(
-                    forward[start:end, :, parent_idx].reshape(-1, num_states, 1) +
-                    transitions.reshape(1, num_states, num_states), axis=1) +
-                    probs[start:end, :, i] - scale[start:end, i].reshape(-1, 1))
             else:
-                tmp = forward[start:end, :, parent_idx]
-                for j in node_children[parent_idx]:
-                    if j == i:
-                        continue
-                    tmp += reverse[start:end, :, j]
-                forward[start:end, :, i] = (scipy.special.logsumexp(
-                    tmp.reshape(-1, num_states, 1) +
-                    transitions.reshape(1, num_states, num_states), axis=1) +
-                    probs[start:end, :, i] - scale[start:end, i].reshape(-1, 1))
+                children_idxs = node_children[parent_idx]
+                if children_idxs.shape[0] == 1:
+                    forward[start:end, :, i] = (scipy.special.logsumexp(
+                        forward[start:end, :, parent_idx].reshape(-1, num_states, 1) +
+                        transitions.reshape(1, num_states, num_states), axis=1) +
+                        probs[start:end, :, i] - scale[start:end, i].reshape(-1, 1))
+                else:
+                    children_idxs = children_idxs[numpy.where(children_idxs != i)[0]]
+                    tmp = forward[start:end, :, parent_idx] + numpy.sum(
+                        reverse[start:end, :, children_idxs], axis=2)
+                    forward[start:end, :, i] = (scipy.special.logsumexp(
+                        tmp.reshape(-1, num_states, 1) +
+                        transitions.reshape(1, num_states, num_states), axis=1) +
+                        probs[start:end, :, i] - scale[start:end, i].reshape(-1, 1))
         for V in views:
             V.close()
         return
@@ -328,26 +334,25 @@ class Node():
         views.append(SharedMemory(smm_map['log_total']))
         log_total = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                                   buffer=views[-1].buf)
+        views.append(SharedMemory(smm_map['total']))
+        total = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
+                              buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['scale']))
         scale = numpy.ndarray((num_seqs, num_nodes), numpy.float64,
                               buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['obs_scores']))
-        obs_scores = numpy.ndarray((num_seqs, 2),
-                                   dtype=numpy.float64, buffer=views[-1].buf)
+        scores = numpy.ndarray((num_seqs, 2),
+                               dtype=numpy.float64, buffer=views[-1].buf)
         for i in node_order:
             children = node_children[i]
-            if len(children) == 0:
+            if children.shape[0] == 0:
                 log_total[s:e, :, i] = forward[s:e, :, i]
-            elif len(children) == 1:
-                log_total[s:e, :, i] = (forward[s:e, :, i] +
-                                       reverse[s:e, :, children[0]])
             else:
                 log_total[s:e, :, i] = forward[s:e, :, i] + numpy.sum(
                     reverse[s:e, :, children], axis=2)
-        log_total[s:e, :, :] -= numpy.amax(log_total[s:e, :, :], axis=1,
-                                           keepdims=True)
 
-        total[s:e, :, :] = numpy.exp(log_total[s:e, :, :])
+        total[s:e, :, :] = numpy.exp(log_total[s:e, :, :] - numpy.amax(
+            log_total[s:e, :, :], axis=1, keepdims=True))
         total[s:e, :, :] /= numpy.sum(total[s:e, :, :], axis=1,
                                              keepdims=True)
         root = node_order[0]
@@ -359,24 +364,24 @@ class Node():
         return
 
     def __str__(self):
+        dists = {}
+        for S in self.states:
+            for D in S.distributions:
+                dists[D.index] = D
+        dists = list(dists.values())
         output = []
-        output.append(f"{self.label} model")
+        output.append(f"{self.label} node")
         output.append(f"Distributions")
-        just = max([len(x.label) for x in self.distributions])
-        for D in self.distributions:
+        just = max([len(x.label) for x in dists])
+        for D in dists:
             tmp = [D.label.rjust(just)] + [f"{name}:{value}" for name, value in
                                D.get_parameters(log=False).items()]
             output.append(f'  {" ".join(tmp)}')
         just2 = max([len(x.label) for x in self.states])
-        output.append("\n\nStates")
+        output.append("\nStates")
         for S in self.states:
             tmp = [S.label.rjust(just2)] + [", ".join([x.label.rjust(just) for x in S.distributions])]
             output.append(f'  {" ".join(tmp)}')
-        output.append(f"\n\nInitial Probabilities")
-        tmp = [f"{x:0.3f}" for x in self.initial_probabilities.initial_probabilities]
-        output.append(", ".join(tmp))
-        output.append("")
-        output.append(self.transitions.print())
         output = "\n".join(output)
         return output
 
