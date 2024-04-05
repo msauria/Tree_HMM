@@ -687,7 +687,8 @@ class EmissionZeroDistribution(EmissionContinuousDistribution):
     def score_observations(self, obs, **kwargs):
         start = kwargs['start']
         end = kwargs['end']
-        prob = (obs[start:end] == 0).astype(numpy.float64)
+        prob = numpy.full(obs.shape[0], -numpy.inf, numpy.float64)
+        prob[numpy.where(obs == 0)] = 0
         return prob
 
     @classmethod
@@ -709,8 +710,8 @@ class EmissionZeroDistribution(EmissionContinuousDistribution):
     def generate_emission(self, RNG):
         return numpy.zeros(1, numpy.float64)
 
-    def get_parameters(self):
-        return numpy.zeros(0, numpy.float64)
+    def get_parameters(self, **kwargs):
+        return {}
 
 
 class EmissionContinuousMixtureDistribution(EmissionContinuousDistribution):
@@ -729,6 +730,7 @@ class EmissionContinuousMixtureDistribution(EmissionContinuousDistribution):
         else:
             self.proportions = RNG.random(size=len(distributions))
         self.proportions /= numpy.sum(self.proportions)
+        self.log_proportions = numpy.log(self.proportions)
         self.num_distributions = len(self.distributions)
         self.distribution_indices = []
         self.index = None
@@ -742,21 +744,16 @@ class EmissionContinuousMixtureDistribution(EmissionContinuousDistribution):
     def score_observations(self, obs, **kwargs):
         start = kwargs['start']
         end = kwargs['end']
-        mixN = kwargs['mixN']
-        smm_map = kwargs['smm_map']
+        node_idx = kwargs['node_idx']
         views = []
+        views.append(SharedMemory(smm_map['sizes']))
+        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['mix_probs']))
-        mix_probs = numpy.ndarray((obs.shape[0], mixN,), numpy.float64,
+        mix_probs = numpy.ndarray((num_seqs, num_mixdists, num_nodes), numpy.float64,
                                   buffer=views[-1].buf)
-        probs = numpy.zeros(end - start, numpy.float64)
-        for i, index in enumerate(self.distribution_indices):
-            mix_probs[start:end, index] *= self.proportions[i]
-            probs += mix_probs[start:end, index]
-        sums = numpy.sum(mix_probs[start:end, self.distribution_indices],
-                         axis=1)
-        where = numpy.where(sums > 0)[0]
-        for i in self.distribution_indices:
-            mix_probs[where + start, i] /= sums[where]
+        probs = scipy.special.logsumexp(mix_probs[start:end, self.distribution_indices, node_idx] +
+                                        self.log_proportions.reshape(-1, 1), axis=1)
         for V in views:
             V.close()
         return probs
@@ -812,8 +809,8 @@ class EmissionContinuousMixtureDistribution(EmissionContinuousDistribution):
         return self.distributions[numpy.searchsorted(numpy.cumsum(
             self.proportions), RNG.random())].generate_emission(RNG)
 
-    def get_parameters(self):
-        return self.proportions, [D.get_parameters() for D in self.distributions]
+    def get_parameters(self, **kwargs):
+        return {'proportions': self.proportions}#, [D.get_parameters() for D in self.distributions]
 
 
 

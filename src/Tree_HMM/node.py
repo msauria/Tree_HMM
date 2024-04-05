@@ -189,8 +189,8 @@ class Node():
         start, end, obsDtype, node, smm_map = args
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_states, num_seqs = sizes
+        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
         node_idx = node.index
         views.append(SharedMemory(smm_map['obs']))
         obs = numpy.ndarray((num_seqs, num_nodes), obsDtype, buffer=views[-1].buf)
@@ -201,15 +201,34 @@ class Node():
         else:
             obs_mask = None
         marks = obs.dtype.names
-        kwargs = {'start': start, "end": end, "smm_map": smm_map}
+        kwargs = {'start': start, "end": end, "node_idx": node_idx, "smm_map": smm_map}
         views.append(SharedMemory(smm_map['dist_probs']))
         dist_probs = numpy.ndarray((num_seqs, num_dists, num_nodes),
                                    numpy.float64, buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['probs']))
         probs = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                               buffer=views[-1].buf)
+        if num_mixdists > 0:
+            views.append(SharedMemory(smm_map['mix_probs']))
+            mix_probs = numpy.ndarray((num_seqs, num_mixdists, num_nodes),
+                                       numpy.float64, buffer=views[-1].buf)
+        else:
+            mix_probs = None
         updated = numpy.zeros(num_dists, bool)
+        mix_updated = numpy.zeros(num_mixdists, bool)
         state_updated = {}
+        for i in range(num_states):
+            for j, D in enumerate(node.states[i].distributions):
+                if not D.name.endswith('Mixture'):
+                    continue
+                for D1 in D.distributions:
+                    if mix_updated[D1.index]:
+                        continue
+                    if D1.updated and D1.fixed:
+                        continue
+                    mix_probs[start:end, D1.index, node_idx] = D1.score_observations(
+                        obs[marks[j]][start:end, node_idx], **kwargs)
+                    mix_updated[D1.index] = True
         for i in range(num_states):
             indices = []
             for j, D in enumerate(node.states[i].distributions):
@@ -365,17 +384,33 @@ class Node():
 
     def __str__(self):
         dists = {}
+        mixdists = {}
         for S in self.states:
             for D in S.distributions:
                 dists[D.index] = D
+                if D.name.endswith('Mixture'):
+                    for D1 in D.distributions:
+                        mixdists[D1.index] = D1
         dists = list(dists.values())
+        mixdists = list(mixdists.values())
         output = []
         output.append(f"{self.label} node")
+        if len(mixdists) > 0:
+            output.append(f"Mixture Distributions")
+            just = max([len(x.label) for x in mixdists])
+            for D in mixdists:
+                tmp = [D.label.rjust(just)] + [f"{name}:{value}" for name, value in
+                                   D.get_parameters(log=False).items()]
+                output.append(f'  {" ".join(tmp)}')
         output.append(f"Distributions")
         just = max([len(x.label) for x in dists])
         for D in dists:
-            tmp = [D.label.rjust(just)] + [f"{name}:{value}" for name, value in
-                               D.get_parameters(log=False).items()]
+            if D.name.endswith("Mixture"):
+                tmp = [D.label.rjust(just)] + [f"{D.proportions[x]*100:0.1f}%:{D.distributions[x].label}"
+                                               for x in range(D.num_distributions)]
+            else:
+                tmp = [D.label.rjust(just)] + [f"{name}:{value}" for name, value in
+                                   D.get_parameters(log=False).items()]
             output.append(f'  {" ".join(tmp)}')
         just2 = max([len(x.label) for x in self.states])
         output.append("\nStates")

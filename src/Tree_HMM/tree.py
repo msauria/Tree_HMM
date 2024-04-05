@@ -76,6 +76,7 @@ class Tree():
             node = self.nodes[name]
             node.initialize_node(state_names=state_names, emissions=node_emissions[i])
         self.num_dists = 0
+        self.num_mixdists = 0
         for name in self.node_order:
             N = self.nodes[name]
             for S in N.states:
@@ -83,6 +84,12 @@ class Tree():
                     if D.index is None:
                         D.index = self.num_dists
                         self.num_dists += 1
+                        if D.name.endswith("Mixture"):
+                            for D1 in D.distributions:
+                                if D1.index is None:
+                                    D1.index = self.num_mixdists
+                                    self.num_mixdists += 1
+                                    D.distribution_indices.append(D1.index)
         self.transitions = node_transitions
         return
 
@@ -222,9 +229,9 @@ class Tree():
             self.make_shared_array(f"obs_mask", (self.num_seqs, self.num_states), bool)
             for i in range(self.num_seqs):
                 self.obs_mask[i, :, :] = obs_mask[i][indices, :].astype(bool)
-        self.make_shared_array(f"sizes", (4,), numpy.int64)
-        self.sizes[:] = (self.num_nodes, self.num_dists, self.num_states,
-                         self.num_seqs)
+        self.make_shared_array(f"sizes", (5,), numpy.int64)
+        self.sizes[:] = (self.num_nodes, self.num_dists, self.num_mixdists,
+                         self.num_states, self.num_seqs)
         return
 
 
@@ -235,6 +242,9 @@ class Tree():
             assert self.num_obs is not None
         self.make_shared_array(f"dist_probs",
                                (self.num_seqs, self.num_dists, self.num_nodes),
+                               numpy.float64)
+        self.make_shared_array(f"mix_probs",
+                               (self.num_seqs, self.num_mixdists, self.num_nodes),
                                numpy.float64)
         self.make_shared_array(f"probs",
                                (self.num_seqs, self.num_states, self.num_nodes),
@@ -285,9 +295,9 @@ class Tree():
     def generate_sequences(self, num_seqs=1):
         assert self.smm_map is not None, "HmmManager must be used inside a 'with' statement"
         self.num_seqs = int(num_seqs)
-        self.make_shared_array(f"sizes", (4,), numpy.int64)
-        self.sizes[:] = (self.num_nodes, self.num_dists, self.num_states,
-                         self.num_seqs)
+        self.make_shared_array(f"sizes", (5,), numpy.int64)
+        self.sizes[:] = (self.num_nodes, self.num_dists, self.num_mixdists,
+                         self.num_states, self.num_seqs)
         self.make_shared_array(f"obs", (self.num_seqs, self.num_nodes),
                                self.root.get_emission_dtype())
         self.make_shared_array(f"obs_states", (self.num_seqs, self.num_nodes),
@@ -318,6 +328,9 @@ class Tree():
         self.ingest_observations(obs, names)
         self.make_shared_array(f"dist_probs",
                                (self.num_seqs, self.num_dists, self.num_nodes),
+                               numpy.float64)
+        self.make_shared_array(f"mix_probs",
+                               (self.num_seqs, self.num_mixdists, self.num_nodes),
                                numpy.float64)
         self.make_shared_array(f"probs",
                                (self.num_seqs, self.num_states, self.num_nodes),
@@ -441,15 +454,29 @@ class Tree():
                 for j, D in enumerate(node.states[i].distributions):
                     if D.fixed:
                         continue
-                    params = D.get_parameters()
+                    if D.name.endswith("Mixture"):
+                        for l, D1 in enumerate(D.distributions):
+                            params = D1.get_parameters()
+                            for k in range(self.thread_seq_indices.shape[0] - 1):
+                                s, e = self.thread_seq_indices[k:k+2]
+                                args.append((D1.update_tallies, s, e, node.label,
+                                             node.index, i, j, l, self.obs.dtype,
+                                             params, self.smm_map))
+                        params = D.distribution_indices
+                    else:
+                        params = D.get_parameters()
                     for k in range(self.thread_seq_indices.shape[0] - 1):
                         s, e = self.thread_seq_indices[k:k+2]
                         args.append((D.update_tallies, s, e, node.label,
                                      node.index, i, j, None, self.obs.dtype,
                                      params, self.smm_map))
+
         for result in self.pool.starmap(EmissionDistribution.update_tallies, args):
-            node_name, state_idx, dist_idx, tallies = result
-            self.nodes[node_name].states[state_idx].distributions[dist_idx].tallies += tallies
+            node_name, state_idx, dist_idx, mix_idx, tallies = result
+            if mix_idx is None:
+                self.nodes[node_name].states[state_idx].distributions[dist_idx].tallies += tallies
+            else:
+                self.nodes[node_name].states[state_idx].distributions[dist_idx].distributions[mix_idx].tallies += tallies
         return
 
     def apply_tallies(self):
@@ -485,22 +512,18 @@ class Tree():
         data['transition_id'] = self.transitions.transition_id
         data['initial_probabilities'] = self.initial_probabilities.initial_probabilities
         data['initial_mapping'] = self.initial_probabilities.initial_mapping
-        dist_map = numpy.zeros(self.num_dists,
-            numpy.dtype([('state', numpy.int32), ('dist', numpy.int32),
-                         ('node', numpy.int32), ('index', numpy.int32)]))
-        pos = 0
+        dist_map = []
         for N in self.nodes.values():
             for i in range(self.num_states):
                 for j, D in enumerate(N.states[i].distributions):
-                    dist_map[pos] = (i, j, N.index, D.index)
-                    pos += 1
+                    dist_map.append((i, j, N.index, D.index, -1))
                     if f"dist_{D.index}" not in data:
                         params = D.get_parameters()
                         dtype = [('name', f'<U{len(D.name)}'),
                                  ('label', f'<U{len(D.label)}'),
                                  ('fixed', bool)]
                         for name, value in params.items():
-                            if (isinstance(type(value), numpy.ndarray) and 
+                            if (isinstance(value, numpy.ndarray) and 
                                 (len(value.shape) > 1 or value.shape[0] > 1)):
                                 dtype.append((name, numpy.float64, value.shape))
                             else:
@@ -511,6 +534,31 @@ class Tree():
                         data[f"dist_{D.index}"]['fixed'] = D.fixed
                         for name, value in params.items():
                             data[f"dist_{D.index}"][name] = value
+                        if D.name.endswith('Mixture'):
+                            for k, D1 in enumerate(D.distributions):
+                                dist_map.append((i, j, N.index, D.index, D1.index))
+                                if f"dist_m{D1.index}" not in data:
+                                    params = D1.get_parameters()
+                                    dtype = [('name', f'<U{len(D1.name)}'),
+                                             ('label', f'<U{len(D1.label)}'),
+                                             ('fixed', bool)]
+                                    for name, value in params.items():
+                                        if (isinstance(value, numpy.ndarray) and 
+                                            (len(value.shape) > 1 or value.shape[0] > 1)):
+                                            dtype.append((name, numpy.float64, value.shape))
+                                        else:
+                                            dtype.append((name, numpy.float64))
+                                    data[f"dist_m{D1.index}"] = numpy.zeros(1, dtype=numpy.dtype(dtype))
+                                    data[f"dist_m{D1.index}"]['name'] = D1.name
+                                    data[f"dist_m{D1.index}"]['label'] = D1.label
+                                    data[f"dist_m{D1.index}"]['fixed'] = D1.fixed
+                                    for name, value in params.items():
+                                        data[f"dist_m{D1.index}"][name] = value
+        dist_map = numpy.array(dist_map,
+            numpy.dtype([('state', numpy.int32), ('dist', numpy.int32),
+                         ('node', numpy.int32), ('index', numpy.int32),
+                         ('mix', numpy.int32)]))
+
         data['distribution_mapping'] = dist_map
         state_names = [self.root.states[x].label for x in range(self.num_states)]
         data['state_names'] = numpy.array(
@@ -521,11 +569,6 @@ class Tree():
             node_names[node.index] = node.label
         data['node_names'] = numpy.array(
             node_names, f"<U{max([len(x) for x in node_names])}")
-        emission_names = ["" for x in range(self.num_dists)]
-        for N in self.nodes.values():
-            for S in N.states:
-                for D in S.distributions:
-                    emission_names[D.index] = D.label
         pairs = [(self.root.label, '')] + [(child, self.nodes[child].parent_name)
                                            for child in self.node_order[1:]]
         maxlen = max([len(x[0]) for x in pairs] + [len(x[1]) for x in pairs])
@@ -561,7 +604,7 @@ class Tree():
         num_nodes = len(node_names)
         distributions = {}
         for name in temp.keys():
-            if not name.startswith('dist_'):
+            if not name.startswith('dist_m'):
                 continue
             params = {}
             for name2 in temp[name].dtype.names:
@@ -575,28 +618,53 @@ class Tree():
                     if len(temp[name][name2].shape) == 1:
                         params[name2] = temp[name][name2][0]
                     else:
-                            params[name2] = temp[name][name2][0, :]
+                        params[name2] = temp[name][name2][0, :]
+            if dname == "Zero":
+                distributions[f"{name}"] = dists[dname](label=label)
+            else:
+                distributions[f"{name}"] = dists[dname](label=label, fixed=fixed, **params)
+        for name in temp.keys():
+            if not name.startswith('dist_'):
+                continue
+            if name.startswith('dist_m'):
+                continue
+            params = {}
+            for name2 in temp[name].dtype.names:
+                if name2 == 'name':
+                    dname = temp[name][name2][0]
+                elif name2 == 'label':
+                    label = temp[name][name2][0]
+                elif name2 == 'fixed':
+                    fixed = temp[name][name2][0]
+                else:
+                    if len(temp[name][name2].shape) == 1:
+                        params[name2] = temp[name][name2][0]
+                    else:
+                        params[name2] = temp[name][name2][0, :]
             if dname == "Zero":
                 distributions[f"{name}"] = dists[dname]()
             elif not dname.endswith("Mixture"):
-                distributions[f"{name}"] = dists[dname](**params)
-            # else:
-            #     index = numpy.where(dist_map['index'] == int(name.split('_')[-1]))[0][0]
-            #     indices = dist_map['index'][numpy.where(numpy.logical_and(numpy.logical_and(
-            #         dist_map['state'] == dist_map['state'][index],
-            #         dist_map['dist'] == dist_map['dist'][index]),
-            #         dist_map['mixdist'] != -1))]
-            #     distributions[name] = dists[dname](
-            #         [mixdistributions[f"mixdist_{x}"] for x in indices],
-            #         **params)
+                distributions[f"{name}"] = dists[dname](label=label, fixed=fixed, **params)
+            else:
+                idx = int(name.split('_')[-1])
+                state_idx, dist_idx, node_idx, idx, _ = dist_map[numpy.where(numpy.logical_and(
+                    dist_map['index'] == idx, dist_map['mix'] == -1))[0][0]]
+                indices = dist_map['mix'][numpy.where(numpy.logical_and(
+                    dist_map['index'] == idx, dist_map['mix'] != -1))]
+                distributions[name] = dists[dname](
+                    [distributions[f"dist_m{x}"] for x in indices],
+                    **params)
             distributions[f"{name}"].label = label
             distributions[f"{name}"].fixed = fixed
             distributions[f"{name}"].index = int(name.split('_')[-1])
         emissions = [[[None for y in range(numpy.amax(dist_map['dist']) + 1)]
                      for x in range(num_states)] for z in range(num_nodes)]
-        for s_idx, d_idx, n_idx, idx in dist_map:
+        for s_idx, d_idx, n_idx, idx, mix in dist_map:
+            if mix != -1:
+                continue
             emissions[n_idx][s_idx][d_idx] = distributions[f"dist_{idx}"]
-        self.num_dists = numpy.amax(dist_map['index']) + 1
+        self.num_dists = numpy.unique(dist_map['index']).shape[0]
+        self.num_mixdists = numpy.unique(dist_map['mix'][numpy.where(dist_map['mix'] != -1)]).shape[0]
         self.load_tree(tree)
         self.num_states = num_states
         transitions = TransitionMatrix(transition_matrix=transition_matrix,
@@ -606,7 +674,6 @@ class Tree():
         for i, name in enumerate(self.node_order):
             node = self.nodes[name]
             node.initialize_node(state_names, emissions[i])
-        self.num_states = num_states
         self.initial_probabilities = init_probs
         self.transitions = transitions
         self.log_probs = 0
