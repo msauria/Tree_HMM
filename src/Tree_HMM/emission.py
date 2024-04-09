@@ -21,9 +21,8 @@ class EmissionDistribution():
         return
 
     @classmethod
-    def update_tallies(self, *args):
-        func = args[0]
-        return func(*args)
+    def update_tallies(self, **kwargs):
+        return kwargs['func'](**kwargs)
 
     def print(self, level=0):
         return f"{' '*level}Base emission distribution {self.label}"
@@ -428,13 +427,20 @@ class EmissionGaussianDistribution(EmissionContinuousDistribution):
         return prob
 
     @classmethod
-    def update_tallies(self, *args):
-        (func, start, end, node_name, node_idx, state_idx, dist_idx, mix_idx,
-         obsDtype, params, smm_map) = args
+    def update_tallies(self, **kwargs):
+        smm_map = kwargs['smm_map']
+        params = kwargs['params']
+        obsDtype = kwargs['obsDtype']
+        node_name = kwargs['node_name']
+        state_idx = kwargs['state_idx']
+        dist_idx = kwargs['dist_idx']
+        mix_idx = kwargs['mix_idx']
+        start = kwargs['start']
+        end = kwargs['end']
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_states, num_seqs = sizes
+        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['obs']))
         obs = numpy.ndarray((num_seqs, num_nodes,), dtype=obsDtype,
                             buffer=views[-1].buf)
@@ -442,7 +448,6 @@ class EmissionGaussianDistribution(EmissionContinuousDistribution):
         total = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                               buffer=views[-1].buf)
         mu = params['mu']
-        sigma = params['sigma']
         names = obsDtype.names
         tallies = numpy.zeros(3, numpy.float64)
         if mix_idx is None:
@@ -455,22 +460,25 @@ class EmissionGaussianDistribution(EmissionContinuousDistribution):
             tallies[2] += numpy.sum(
                 total[start:end, state_idx, node_idx])
         else:
-            index, mixN = params[-2:]
+            mix_indices = kwargs['mix_indices']
             views.append(SharedMemory(smm_map['mix_probs']))
-            mixprobs = numpy.ndarray((obsN, mixN,), numpy.float64,
-                                     buffer=views[-1].buf)
-            for i in range(start, end):
-                s, e = obs_indices[i:i+2]
-                seq_prob = numpy.sum(numpy.exp(probs[e - 1, :, 1]))
-                tmpProbs = mixprobs[s:e, index] * probs[s:e, state_idx, 4]
-                tallies[0] += (numpy.sum(obs[names[dist_idx]][s:e] * tmpProbs) /
-                               seq_prob)
-                tallies[1] += (numpy.sum((obs[names[dist_idx]][s:e] -
-                                          mu) ** 2 * tmpProbs) / seq_prob)
-                tallies[2] += numpy.sum(tmpProbs) / seq_prob
+            mix_probs = numpy.ndarray((num_seqs, num_mixdists), numpy.float64,
+                                  buffer=views[-1].buf)
+            proportions = params['proportions']
+            mix_proportions = numpy.exp(mix_probs[start:end, mix_indices] -
+                                        numpy.amax(mix_probs[start:end, mix_indices],
+                                                   axis=1, keepdims=True))
+            mix_proportions *= proportions.reshape(1, -1)
+            mix_proportions /= numpy.sum(mix_proportions, axis=1, keepdim=True)
+            probs = total[start:end, state_idx, node_idx] * mix_proportions[:, mix_idx]
+            tallies[0] += numpy.sum(
+                obs[names[dist_idx]][start:end, node_idx] * probs)
+            tallies[1] += numpy.sum(
+                (obs[names[dist_idx]][start:end, node_idx] - mu) ** 2 * probs)
+            tallies[2] += numpy.sum(probs)
         for V in views:
             V.close()
-        return node_name, state_idx, dist_idx, tallies
+        return node_name, state_idx, dist_idx, mix_idx, tallies
 
     def apply_tallies(self):
         if self.updated:
@@ -692,11 +700,13 @@ class EmissionZeroDistribution(EmissionContinuousDistribution):
         return prob
 
     @classmethod
-    def update_tallies(self, *args):
-        (func, start, end, state_idx, dist_idx, mix_idx,
-         obsDtype, probsShape, params, smm_map) = args
+    def update_tallies(self, **kwargs):
+        node_name = kwargs['node_name']
+        state_idx = kwargs['state_idx']
+        dist_idx = kwargs['dist_idx']
+        mix_idx = kwargs['mix_idx']
         tallies = numpy.zeros(0, numpy.float64)
-        return state_idx, dist_idx, mix_idx, tallies
+        return node_name, state_idx, dist_idx, mix_idx, tallies
 
     def apply_tallies(self):
         if self.updated:
@@ -734,7 +744,6 @@ class EmissionContinuousMixtureDistribution(EmissionContinuousDistribution):
         self.num_distributions = len(self.distributions)
         self.distribution_indices = []
         self.index = None
-        self.mix_index = None
         self.tallies = numpy.zeros(self.num_distributions, numpy.float64)
         self.fixed = bool(fixed)
         self.label = str(label)
@@ -744,15 +753,14 @@ class EmissionContinuousMixtureDistribution(EmissionContinuousDistribution):
     def score_observations(self, obs, **kwargs):
         start = kwargs['start']
         end = kwargs['end']
-        node_idx = kwargs['node_idx']
         views = []
         views.append(SharedMemory(smm_map['sizes']))
         sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
         num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['mix_probs']))
-        mix_probs = numpy.ndarray((num_seqs, num_mixdists, num_nodes), numpy.float64,
+        mix_probs = numpy.ndarray((num_seqs, num_mixdists), numpy.float64,
                                   buffer=views[-1].buf)
-        probs = scipy.special.logsumexp(mix_probs[start:end, self.distribution_indices, node_idx] +
+        probs = scipy.special.logsumexp(mix_probs[start:end, self.distribution_indices] +
                                         self.log_proportions.reshape(-1, 1), axis=1)
         for V in views:
             V.close()
@@ -765,26 +773,33 @@ class EmissionContinuousMixtureDistribution(EmissionContinuousDistribution):
         return
 
     @classmethod
-    def update_tallies(self, *args):
-        (func, start, end, state_idx, dist_idx, mix_idx,
-         obsDtype, probsShape, params, smm_map) = args
-        proportions, _, distribution_indices, mixN = params
-        obsN = probsShape[0]
+    def update_tallies(self, **kwargs):
+        smm_map = kwargs['smm_map']
+        params = kwargs['params']
+        node_name = kwargs['node_name']
+        state_idx = kwargs['state_idx']
+        dist_idx = kwargs['dist_idx']
+        mix_idx = kwargs['mix_idx']
+        start = kwargs['start']
+        end = kwargs['end']
+        proportions = params['proportions']
+        dist_indices = params['dist_indices']
         views = []
-        views.append(SharedMemory(smm_map['probs']))
-        probs = numpy.ndarray(probsShape, dtype=numpy.float64,
-                              buffer=views[-1].buf)
+        views.append(SharedMemory(smm_map['sizes']))
+        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['mix_probs']))
-        mixprobs = numpy.ndarray((obsN, mixN,), numpy.float64,
-                                 buffer=views[-1].buf)
-        names = obsDtype.names
-        tallies = numpy.zeros(distribution_indices.shape[0], numpy.float64)
-        tmpProbs = (mixprobs[start:end, distribution_indices] *
-                    probs[start:end, state_idx, 3:4])
-        tallies = numpy.sum(tmpProbs, axis=0)
+        mix_probs = numpy.ndarray((num_seqs, num_mixdists), numpy.float64,
+                              buffer=views[-1].buf)
+        mix_proportions = numpy.exp(mix_probs[start:end, dist_indices] -
+                                    numpy.amax(mix_probs[start:end, dist_indices],
+                                               axis=1, keepdims=True))
+        mix_proportions *= proportions.reshape(1, -1)
+        mix_proportions /= numpy.sum(mix_proportions, axis=1, keepdim=True)
+        tallies = numpy.sum(mix_proportions, axis=0)
         for V in views:
             V.close()
-        return state_idx, dist_idx, mix_idx, tallies
+        return node_name, state_idx, dist_idx, mix_idx, tallies
 
     def apply_tallies(self):
         for D in self.distributions:

@@ -52,8 +52,8 @@ class TransitionMatrix():
         s, e, pairs, node_children, transitions, smm_map = args
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_states, num_seqs = sizes
+        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['probs']))
         probs = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                               buffer=views[-1].buf)

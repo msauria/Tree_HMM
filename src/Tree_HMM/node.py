@@ -105,8 +105,8 @@ class Node():
         obs_dtype = root.states[0].get_observation_dtype()
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_states, num_seqs = sizes
+        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
         RNG = numpy.random.default_rng(seed)
         views.append(SharedMemory(smm_map['obs']))
         obs = numpy.ndarray((num_seqs, num_nodes), obs_dtype, buffer=views[-1].buf)
@@ -145,8 +145,8 @@ class Node():
             node_order, smm_map) = args
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_states, num_seqs = sizes
+        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['probs']))
         probs = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                               buffer=views[-1].buf)
@@ -203,14 +203,14 @@ class Node():
         marks = obs.dtype.names
         kwargs = {'start': start, "end": end, "node_idx": node_idx, "smm_map": smm_map}
         views.append(SharedMemory(smm_map['dist_probs']))
-        dist_probs = numpy.ndarray((num_seqs, num_dists, num_nodes),
+        dist_probs = numpy.ndarray((num_seqs, num_dists),
                                    numpy.float64, buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['probs']))
         probs = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                               buffer=views[-1].buf)
         if num_mixdists > 0:
             views.append(SharedMemory(smm_map['mix_probs']))
-            mix_probs = numpy.ndarray((num_seqs, num_mixdists, num_nodes),
+            mix_probs = numpy.ndarray((num_seqs, num_mixdists),
                                        numpy.float64, buffer=views[-1].buf)
         else:
             mix_probs = None
@@ -226,7 +226,7 @@ class Node():
                         continue
                     if D1.updated and D1.fixed:
                         continue
-                    mix_probs[start:end, D1.index, node_idx] = D1.score_observations(
+                    mix_probs[start:end, D1.index] = D1.score_observations(
                         obs[marks[j]][start:end, node_idx], **kwargs)
                     mix_updated[D1.index] = True
         for i in range(num_states):
@@ -237,7 +237,7 @@ class Node():
                     continue
                 if D.updated and D.fixed:
                     continue
-                dist_probs[start:end, D.index, node_idx] = D.score_observations(
+                dist_probs[start:end, D.index] = D.score_observations(
                     obs[marks[j]][start:end, node_idx], **kwargs)
                 updated[D.index] = True
             indices = tuple(indices)
@@ -246,7 +246,7 @@ class Node():
                     probs[start:end, state_updated[indices], node_idx])
             else:
                 probs[start:end, i, node_idx] = numpy.sum(
-                    dist_probs[start:end, indices, node_idx], axis=1)
+                    dist_probs[start:end, indices], axis=1)
                 state_updated[indices] = i
         if obs_mask is not None:
             where = numpy.where(numpy.logical_not(obs_mask[start:end, :]))
@@ -260,8 +260,8 @@ class Node():
         start, end, transitions, node_children, node_order, smm_map = args
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_states, num_seqs = sizes
+        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['probs']))
         probs = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                               buffer=views[-1].buf)
@@ -296,8 +296,8 @@ class Node():
          node_order, smm_map) = args
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_states, num_seqs = sizes
+        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['probs']))
         probs = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                               buffer=views[-1].buf)
@@ -342,8 +342,8 @@ class Node():
         s, e, node_children, node_order, smm_map = args
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_states, num_seqs = sizes
+        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['forward']))
         forward = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                                 buffer=views[-1].buf)

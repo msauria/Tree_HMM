@@ -241,10 +241,10 @@ class Tree():
         else:
             assert self.num_obs is not None
         self.make_shared_array(f"dist_probs",
-                               (self.num_seqs, self.num_dists, self.num_nodes),
+                               (self.num_seqs, self.num_dists),
                                numpy.float64)
         self.make_shared_array(f"mix_probs",
-                               (self.num_seqs, self.num_mixdists, self.num_nodes),
+                               (self.num_seqs, self.num_mixdists),
                                numpy.float64)
         self.make_shared_array(f"probs",
                                (self.num_seqs, self.num_states, self.num_nodes),
@@ -327,10 +327,10 @@ class Tree():
             obs = [obs]
         self.ingest_observations(obs, names)
         self.make_shared_array(f"dist_probs",
-                               (self.num_seqs, self.num_dists, self.num_nodes),
+                               (self.num_seqs, self.num_dists),
                                numpy.float64)
         self.make_shared_array(f"mix_probs",
-                               (self.num_seqs, self.num_mixdists, self.num_nodes),
+                               (self.num_seqs, self.num_mixdists),
                                numpy.float64)
         self.make_shared_array(f"probs",
                                (self.num_seqs, self.num_states, self.num_nodes),
@@ -454,22 +454,32 @@ class Tree():
                 for j, D in enumerate(node.states[i].distributions):
                     if D.fixed:
                         continue
+                    kwargs = {}
+                    kwargs['smm_map'] = self.smm_map
+                    kwargs['obsDtype'] = self.obs.dtype
+                    kwargs['node_name'] = node.label
+                    kwargs['state_idx'] = i
+                    kwargs['dist_idx'] = j
+                    kwargs['mix_idx'] = None
+                    kwargs['params'] = D.get_parameters()
                     if D.name.endswith("Mixture"):
+                        kwargs['mix_indices'] = D.distribution_indices
                         for l, D1 in enumerate(D.distributions):
-                            params = D1.get_parameters()
+                            kwargs['params'].update(D1.get_parameters())
+                            kwargs['mix_idx'] = l
+                            kwargs['func'] = D1.update_tallies
                             for k in range(self.thread_seq_indices.shape[0] - 1):
                                 s, e = self.thread_seq_indices[k:k+2]
-                                args.append((D1.update_tallies, s, e, node.label,
-                                             node.index, i, j, l, self.obs.dtype,
-                                             params, self.smm_map))
-                        params = D.distribution_indices
-                    else:
-                        params = D.get_parameters()
+                                kwargs['start'] = s
+                                kwargs['end'] = e
+                                args.append(copy.deepcopy(kwargs))
+                        kwargs['mix_idx'] = None
+                    kwargs['func'] = D.update_tallies
                     for k in range(self.thread_seq_indices.shape[0] - 1):
                         s, e = self.thread_seq_indices[k:k+2]
-                        args.append((D.update_tallies, s, e, node.label,
-                                     node.index, i, j, None, self.obs.dtype,
-                                     params, self.smm_map))
+                        kwargs['start'] = s
+                        kwargs['end'] = e
+                        args.append(kwargs)
 
         for result in self.pool.starmap(EmissionDistribution.update_tallies, args):
             node_name, state_idx, dist_idx, mix_idx, tallies = result
