@@ -92,27 +92,29 @@ class Node():
 
     def get_emission_dtype(self):
         dtypes = []
-        for i in range(self.states[0].num_distributions):
-            if issubclass(type(self.states[0].distributions[i]), EmissionContinuousDistribution):
-                dtypes.append(numpy.float64)
-            else:
-                dtypes.append(numpy.int32)
+        for D in self.states[0].distributions:
+            dtypes.append(D.dtype)
         return numpy.dtype([(f"{x}", dtypes[x]) for x in range(len(dtypes))])
 
     @classmethod
-    def generate_sequences(cls, *args):
-        start, end, root, initprobs, transitions, smm_map, seed = args
-        obs_dtype = root.states[0].get_observation_dtype()
+    def generate_sequences(cls, **kwargs):
+        start = kwargs['start']
+        end = kwargs['end']
+        root = kwargs['root']
+        obsDtype = kwargs['obsDtype']
+        initprobs = kwargs['initprobs']
+        transitions = kwargs['transitions']
+        smm_map = kwargs['smm_map']
+        seed = kwargs['seed']
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
+        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_states, num_seqs = sizes
         RNG = numpy.random.default_rng(seed)
         views.append(SharedMemory(smm_map['obs']))
-        obs = numpy.ndarray((num_seqs, num_nodes), obs_dtype, buffer=views[-1].buf)
+        obs = numpy.ndarray((num_seqs, num_nodes), obsDtype, buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['obs_states']))
         states = numpy.ndarray((num_seqs, num_nodes,), numpy.int32, buffer=views[-1].buf)
-        initprobs = numpy.cumsum(initprobs)
         for i in range(start, end):
             states[i, root.index] = numpy.searchsorted(initprobs, RNG.random())
             root.generate_sequence(states[i, :], obs[i, :], transitions, RNG)
@@ -121,7 +123,7 @@ class Node():
         return
 
     def generate_sequence(self, states, obs, transitions, RNG):
-        state = states[self.index]        
+        state = states[self.index]
         obs[self.index] = self.states[state].generate_sequence(RNG)
         for C in self.children:
             states[C.index] = transitions.generate_transition(state, RNG)
@@ -140,13 +142,19 @@ class Node():
         return params
 
     @classmethod
-    def find_paths(self, *args):
-        (start, end, initprobs, transitions, node_parents, node_children,
-            node_order, smm_map) = args
+    def find_paths(self, **kwargs):
+        start = kwargs['start']
+        end = kwargs['end']
+        initprobs = kwargs['initprobs']
+        transitions = kwargs['transitions']
+        node_parents = kwargs['node_parents']
+        node_children = kwargs['node_children']
+        node_order = kwargs['node_order']
+        smm_map = kwargs['smm_map']
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
+        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['probs']))
         probs = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                               buffer=views[-1].buf)
@@ -185,13 +193,18 @@ class Node():
         return
 
     @classmethod
-    def find_probs(self, *args):
-        start, end, obsDtype, node, smm_map = args
+    def find_probs(self, **kwargs):
+        start = kwargs['start']
+        end = kwargs['end']
+        obsDtype = kwargs['obsDtype']
+        node = kwargs['node']
+        del kwargs['node']
+        node_idx = node.index
+        smm_map = kwargs['smm_map']
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
-        node_idx = node.index
+        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['obs']))
         obs = numpy.ndarray((num_seqs, num_nodes), obsDtype, buffer=views[-1].buf)
         if 'obs_mask' in smm_map:
@@ -201,34 +214,14 @@ class Node():
         else:
             obs_mask = None
         marks = obs.dtype.names
-        kwargs = {'start': start, "end": end, "node_idx": node_idx, "smm_map": smm_map}
         views.append(SharedMemory(smm_map['dist_probs']))
         dist_probs = numpy.ndarray((num_seqs, num_dists),
                                    numpy.float64, buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['probs']))
         probs = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                               buffer=views[-1].buf)
-        if num_mixdists > 0:
-            views.append(SharedMemory(smm_map['mix_probs']))
-            mix_probs = numpy.ndarray((num_seqs, num_mixdists),
-                                       numpy.float64, buffer=views[-1].buf)
-        else:
-            mix_probs = None
         updated = numpy.zeros(num_dists, bool)
-        mix_updated = numpy.zeros(num_mixdists, bool)
         state_updated = {}
-        for i in range(num_states):
-            for j, D in enumerate(node.states[i].distributions):
-                if not D.name.endswith('Mixture'):
-                    continue
-                for D1 in D.distributions:
-                    if mix_updated[D1.index]:
-                        continue
-                    if D1.updated and D1.fixed:
-                        continue
-                    mix_probs[start:end, D1.index] = D1.score_observations(
-                        obs[marks[j]][start:end, node_idx], **kwargs)
-                    mix_updated[D1.index] = True
         for i in range(num_states):
             indices = []
             for j, D in enumerate(node.states[i].distributions):
@@ -256,12 +249,17 @@ class Node():
         return
 
     @classmethod
-    def find_reverse(self, *args):
-        start, end, transitions, node_children, node_order, smm_map = args
+    def find_reverse(self, **kwargs):
+        start = kwargs['start']
+        end = kwargs['end']
+        transitions = kwargs['transitions']
+        node_children = kwargs['node_children']
+        node_order = kwargs['node_order']
+        smm_map = kwargs['smm_map']
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
+        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['probs']))
         probs = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                               buffer=views[-1].buf)
@@ -291,13 +289,19 @@ class Node():
         return
 
     @classmethod
-    def find_forward(self, *args):
-        (start, end, initprobs, transitions, node_parents, node_children,
-         node_order, smm_map) = args
+    def find_forward(self, **kwargs):
+        start = kwargs['start']
+        end = kwargs['end']
+        initprobs = kwargs['initprobs']
+        transitions = kwargs['transitions']
+        node_parents = kwargs['node_parents']
+        node_children = kwargs['node_children']
+        node_order = kwargs['node_order']
+        smm_map = kwargs['smm_map']
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
+        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['probs']))
         probs = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                               buffer=views[-1].buf)
@@ -338,12 +342,16 @@ class Node():
         return
 
     @classmethod
-    def find_total(self, *args):
-        s, e, node_children, node_order, smm_map = args
+    def find_total(self, **kwargs):
+        start = kwargs['start']
+        end = kwargs['end']
+        node_children = kwargs['node_children']
+        node_order = kwargs['node_order']
+        smm_map = kwargs['smm_map']
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
+        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['forward']))
         forward = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                                 buffer=views[-1].buf)
@@ -365,19 +373,19 @@ class Node():
         for i in node_order:
             children = node_children[i]
             if children.shape[0] == 0:
-                log_total[s:e, :, i] = forward[s:e, :, i]
+                log_total[start:end, :, i] = forward[start:end, :, i]
             else:
-                log_total[s:e, :, i] = forward[s:e, :, i] + numpy.sum(
-                    reverse[s:e, :, children], axis=2)
+                log_total[start:end, :, i] = forward[start:end, :, i] + numpy.sum(
+                    reverse[start:end, :, children], axis=2)
 
-        total[s:e, :, :] = numpy.exp(log_total[s:e, :, :] - numpy.amax(
-            log_total[s:e, :, :], axis=1, keepdims=True))
-        total[s:e, :, :] /= numpy.sum(total[s:e, :, :], axis=1,
+        total[start:end, :, :] = numpy.exp(log_total[start:end, :, :] - numpy.amax(
+            log_total[start:end, :, :], axis=1, keepdims=True))
+        total[start:end, :, :] /= numpy.sum(total[start:end, :, :], axis=1,
                                              keepdims=True)
         root = node_order[0]
-        tmp = scipy.special.logsumexp(log_total[s:e, :, root], axis=1)
-        scores[s:e, 0] = numpy.sum(scale[s:e, :], axis=1)
-        scores[s:e, 1] = tmp + scores[s:e, 0]
+        tmp = scipy.special.logsumexp(log_total[start:end, :, root], axis=1)
+        scores[start:end, 0] = numpy.sum(scale[start:end, :], axis=1)
+        scores[start:end, 1] = tmp + scores[start:end, 0]
         for V in views:
             V.close()
         return

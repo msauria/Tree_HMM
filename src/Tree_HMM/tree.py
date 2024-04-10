@@ -76,7 +76,6 @@ class Tree():
             node = self.nodes[name]
             node.initialize_node(state_names=state_names, emissions=node_emissions[i])
         self.num_dists = 0
-        self.num_mixdists = 0
         for name in self.node_order:
             N = self.nodes[name]
             for S in N.states:
@@ -85,11 +84,11 @@ class Tree():
                         D.index = self.num_dists
                         self.num_dists += 1
                         if D.name.endswith("Mixture"):
-                            for D1 in D.distributions:
+                            for i, D1 in enumerate(D.distributions):
                                 if D1.index is None:
-                                    D1.index = self.num_mixdists
-                                    self.num_mixdists += 1
-                                    D.distribution_indices.append(D1.index)
+                                    D1.index = self.num_dists
+                                    self.num_dists += 1
+                                D.distribution_indices[i] = D1.index
         self.transitions = node_transitions
         return
 
@@ -229,9 +228,9 @@ class Tree():
             self.make_shared_array(f"obs_mask", (self.num_seqs, self.num_states), bool)
             for i in range(self.num_seqs):
                 self.obs_mask[i, :, :] = obs_mask[i][indices, :].astype(bool)
-        self.make_shared_array(f"sizes", (5,), numpy.int64)
-        self.sizes[:] = (self.num_nodes, self.num_dists, self.num_mixdists,
-                         self.num_states, self.num_seqs)
+        self.make_shared_array(f"sizes", (4,), numpy.int64)
+        self.sizes[:] = (self.num_nodes, self.num_dists,  self.num_states,
+                         self.num_seqs)
         return
 
 
@@ -242,9 +241,6 @@ class Tree():
             assert self.num_obs is not None
         self.make_shared_array(f"dist_probs",
                                (self.num_seqs, self.num_dists),
-                               numpy.float64)
-        self.make_shared_array(f"mix_probs",
-                               (self.num_seqs, self.num_mixdists),
                                numpy.float64)
         self.make_shared_array(f"probs",
                                (self.num_seqs, self.num_states, self.num_nodes),
@@ -272,7 +268,7 @@ class Tree():
         prev_prob = 1
         for i in range(iterations):
             prob = self.update_model()
-            print(f"\r{" "*80}\rIteration {i}: Log-prob {prob: 0.1f}", end='',
+            print(f"\r{" "*80}\rIteration {i}: Log-prob {prob: 0.1f}", end='\n',
                   file=sys.stderr)
             #self.plot_params(i)
             # self.save(f"model_iter{i}.npz")
@@ -295,23 +291,32 @@ class Tree():
     def generate_sequences(self, num_seqs=1):
         assert self.smm_map is not None, "HmmManager must be used inside a 'with' statement"
         self.num_seqs = int(num_seqs)
-        self.make_shared_array(f"sizes", (5,), numpy.int64)
-        self.sizes[:] = (self.num_nodes, self.num_dists, self.num_mixdists,
-                         self.num_states, self.num_seqs)
+        self.make_shared_array(f"sizes", (4,), numpy.int64)
+        self.sizes[:] = (self.num_nodes, self.num_dists, self.num_states,
+                         self.num_seqs)
         self.make_shared_array(f"obs", (self.num_seqs, self.num_nodes),
                                self.root.get_emission_dtype())
         self.make_shared_array(f"obs_states", (self.num_seqs, self.num_nodes),
                                numpy.int32)
         self.thread_seq_indices = numpy.round(numpy.linspace(
             0, self.num_seqs, self.nthreads + 1)).astype(numpy.int32)
-        args = []
+        kwargs = {
+            'initprobs': self.initial_probabilities.initprobsum,
+            'transitions': self.transitions,
+            'obsDtype': self.root.get_emission_dtype(),
+            'root': self.root,
+            'seed': self.RNG.integers(0, 99999999),
+            'smm_map': self.smm_map
+        }
+        futures = []
         for i in range(self.thread_seq_indices.shape[0] - 1):
             s, e = self.thread_seq_indices[i:i+2]
-            args.append([s, e, self.root, self.initial_probabilities.initial_probabilities,
-                         self.transitions, self.smm_map,
-                         self.RNG.integers(0, 99999999)])
-        for result in self.pool.starmap(Node.generate_sequences, args):
-            continue
+            kwargs['start'] = s
+            kwargs['end'] = e
+            futures.append(self.pool.apply_async(Node.generate_sequences,
+                                                 kwds=copy.deepcopy(kwargs)))
+        for result in futures:
+            _ = result.get()
         names = ["" for x in range(self.num_nodes)]
         for node in self.nodes.values():
             names[node.index] = node.label
@@ -328,9 +333,6 @@ class Tree():
         self.ingest_observations(obs, names)
         self.make_shared_array(f"dist_probs",
                                (self.num_seqs, self.num_dists),
-                               numpy.float64)
-        self.make_shared_array(f"mix_probs",
-                               (self.num_seqs, self.num_mixdists),
                                numpy.float64)
         self.make_shared_array(f"probs",
                                (self.num_seqs, self.num_states, self.num_nodes),
@@ -372,14 +374,23 @@ class Tree():
         return
 
     def find_paths(self):
-        args = []
+        kwargs = {
+            'initprobs': self.initial_probabilities[:],
+            'transitions': self.transitions[:, :],
+            'node_parents': self.node_parents,
+            'node_children': self.node_children,
+            'node_order': self.node_idx_order,
+            'smm_map': self.smm_map
+        }
+        futures = []
         for i in range(self.thread_seq_indices.shape[0] - 1):
             s, e = self.thread_seq_indices[i:i+2]
-            args.append((s, e, self.initial_probabilities[:],
-                         self.transitions[:, :], self.node_parents,
-                         self.node_children, self.node_idx_order, self.smm_map))
-        for result in self.pool.starmap(Node.find_paths, args):
-            continue
+            kwargs['start'] = s
+            kwargs['end'] = e
+            futures.append(self.pool.apply_async(Node.find_paths,
+                                                 kwds=copy.deepcopy(kwargs)))
+        for result in futures:
+            _ = result.get()
         return
 
     def clear_tallies(self):
@@ -390,43 +401,76 @@ class Tree():
         return
 
     def find_probs(self):
-        args = []
+        kwargs = {
+            'obsDtype': self.obs.dtype,
+            'smm_map': self.smm_map
+        }
+        futures = []
         for node in self.nodes.values():
+            kwargs['node'] = node
             for i in range(self.thread_seq_indices.shape[0] - 1):
                 s, e = self.thread_seq_indices[i:i+2]
-                args.append((s, e, self.obs.dtype, node, self.smm_map))
-        for result in self.pool.starmap(Node.find_probs, args):
-            continue
+                kwargs['start'] = s
+                kwargs['end'] = e
+                futures.append(self.pool.apply_async(Node.find_probs,
+                                                     kwds=copy.deepcopy(kwargs)))
+        for result in futures:
+            _ = result.get()
         return
 
     def find_reverse(self):
-        args = []
+        kwargs = {
+            'transitions': self.transitions[:, :],
+            'node_children': self.node_children,
+            'node_order': self.node_idx_order,
+            'smm_map': self.smm_map
+        }
+        futures = []
         for i in range(self.thread_seq_indices.shape[0] - 1):
             s, e = self.thread_seq_indices[i:i+2]
-            args.append((s, e, self.transitions[:, :], self.node_children,
-                         self.node_idx_order, self.smm_map))
-        for result in self.pool.starmap(Node.find_reverse, args):
-            continue
+            kwargs['start'] = s
+            kwargs['end'] = e
+            futures.append(self.pool.apply_async(Node.find_reverse,
+                                                 kwds=copy.deepcopy(kwargs)))
+        for result in futures:
+            _ = result.get()
         return
 
     def find_forward(self):
-        args = []
+        kwargs = {
+            'initprobs': self.initial_probabilities[:],
+            'transitions': self.transitions[:, :],
+            'node_parents': self.node_parents,
+            'node_children': self.node_children,
+            'node_order': self.node_idx_order,
+            'smm_map': self.smm_map
+        }
+        futures = []
         for i in range(self.thread_seq_indices.shape[0] - 1):
             s, e = self.thread_seq_indices[i:i+2]
-            args.append((s, e, self.initial_probabilities[:],
-                         self.transitions[:, :], self.node_parents,
-                         self.node_children, self.node_idx_order, self.smm_map))
-        for result in self.pool.starmap(Node.find_forward, args):
-            continue
+            kwargs['start'] = s
+            kwargs['end'] = e
+            futures.append(self.pool.apply_async(Node.find_forward,
+                                                 kwds=copy.deepcopy(kwargs)))
+        for result in futures:
+            _ = result.get()
         return
 
     def find_total(self):
-        args = []
+        kwargs = {
+            'node_children': self.node_children,
+            'node_order': self.node_idx_order,
+            'smm_map': self.smm_map
+        }
+        futures = []
         for i in range(self.thread_seq_indices.shape[0] - 1):
             s, e = self.thread_seq_indices[i:i+2]
-            args.append((s, e, self.node_children, self.node_idx_order, self.smm_map))
-        for result in self.pool.starmap(Node.find_total, args):
-            continue
+            kwargs['start'] = s
+            kwargs['end'] = e
+            futures.append(self.pool.apply_async(Node.find_total,
+                                                 kwds=copy.deepcopy(kwargs)))
+        for result in futures:
+            _ = result.get()
         return
 
     def update_tallies(self):
@@ -437,56 +481,50 @@ class Tree():
         return
 
     def update_transition_tallies(self):
-        args = []
-        # self.node_pairs = [[1, 0], [2, 1], [3, 1]]
+        kwargs = {
+            'node_pairs': self.node_pairs,
+            'node_children': self.node_children,
+            'transitions': self.transitions[:, :],
+            'smm_map': self.smm_map
+        }
+        futures = []
         for i in range(self.thread_seq_indices.shape[0] - 1):
             s, e = self.thread_seq_indices[i:i+2]
-            args.append((s, e, self.node_pairs, self.node_children,
-                         self.transitions[:, :], self.smm_map))
-        for result in self.pool.starmap(TransitionMatrix.update_tallies, args):
-            self.transitions.tallies += result
+            kwargs['start'] = s
+            kwargs['end'] = e
+            futures.append(self.pool.apply_async(TransitionMatrix.find_tallies,
+                                                 kwds=copy.deepcopy(kwargs)))
+        for result in futures:
+            self.transitions.update_tallies(result.get())
         return
 
     def update_emission_tallies(self):
-        args = []
+        kwargs = {
+            'obsDtype': self.obs.dtype,
+            'smm_map': self.smm_map
+        }
+        futures = []
         for node in self.nodes.values():
+            kwargs['node_name'] = node.label
+            kwargs['node_idx'] = node.index
             for i in range(self.num_states):
+                kwargs['state_idx'] = i
                 for j, D in enumerate(node.states[i].distributions):
                     if D.fixed:
                         continue
-                    kwargs = {}
-                    kwargs['smm_map'] = self.smm_map
-                    kwargs['obsDtype'] = self.obs.dtype
-                    kwargs['node_name'] = node.label
-                    kwargs['state_idx'] = i
                     kwargs['dist_idx'] = j
-                    kwargs['mix_idx'] = None
                     kwargs['params'] = D.get_parameters()
-                    if D.name.endswith("Mixture"):
-                        kwargs['mix_indices'] = D.distribution_indices
-                        for l, D1 in enumerate(D.distributions):
-                            kwargs['params'].update(D1.get_parameters())
-                            kwargs['mix_idx'] = l
-                            kwargs['func'] = D1.update_tallies
-                            for k in range(self.thread_seq_indices.shape[0] - 1):
-                                s, e = self.thread_seq_indices[k:k+2]
-                                kwargs['start'] = s
-                                kwargs['end'] = e
-                                args.append(copy.deepcopy(kwargs))
-                        kwargs['mix_idx'] = None
-                    kwargs['func'] = D.update_tallies
+                    kwargs['func'] = D.find_tallies
                     for k in range(self.thread_seq_indices.shape[0] - 1):
                         s, e = self.thread_seq_indices[k:k+2]
                         kwargs['start'] = s
                         kwargs['end'] = e
-                        args.append(kwargs)
-
-        for result in self.pool.starmap(EmissionDistribution.update_tallies, args):
-            node_name, state_idx, dist_idx, mix_idx, tallies = result
-            if mix_idx is None:
-                self.nodes[node_name].states[state_idx].distributions[dist_idx].tallies += tallies
-            else:
-                self.nodes[node_name].states[state_idx].distributions[dist_idx].distributions[mix_idx].tallies += tallies
+                        futures.append(self.pool.apply_async(
+                            EmissionDistribution.find_tallies,
+                            kwds=copy.deepcopy(kwargs)))
+        for result in futures:
+            node_name, state_idx, dist_idx, tallies = result.get()
+            self.nodes[node_name].states[state_idx].distributions[dist_idx].update_tallies(tallies)
         return
 
     def apply_tallies(self):
@@ -526,49 +564,16 @@ class Tree():
         for N in self.nodes.values():
             for i in range(self.num_states):
                 for j, D in enumerate(N.states[i].distributions):
-                    dist_map.append((i, j, N.index, D.index, -1))
+                    dist_map.append((i, j, N.index, D.index))
                     if f"dist_{D.index}" not in data:
-                        params = D.get_parameters()
-                        dtype = [('name', f'<U{len(D.name)}'),
-                                 ('label', f'<U{len(D.label)}'),
-                                 ('fixed', bool)]
-                        for name, value in params.items():
-                            if (isinstance(value, numpy.ndarray) and 
-                                (len(value.shape) > 1 or value.shape[0] > 1)):
-                                dtype.append((name, numpy.float64, value.shape))
-                            else:
-                                dtype.append((name, numpy.float64))
-                        data[f"dist_{D.index}"] = numpy.zeros(1, dtype=numpy.dtype(dtype))
-                        data[f"dist_{D.index}"]['name'] = D.name
-                        data[f"dist_{D.index}"]['label'] = D.label
-                        data[f"dist_{D.index}"]['fixed'] = D.fixed
-                        for name, value in params.items():
-                            data[f"dist_{D.index}"][name] = value
-                        if D.name.endswith('Mixture'):
-                            for k, D1 in enumerate(D.distributions):
-                                dist_map.append((i, j, N.index, D.index, D1.index))
-                                if f"dist_m{D1.index}" not in data:
-                                    params = D1.get_parameters()
-                                    dtype = [('name', f'<U{len(D1.name)}'),
-                                             ('label', f'<U{len(D1.label)}'),
-                                             ('fixed', bool)]
-                                    for name, value in params.items():
-                                        if (isinstance(value, numpy.ndarray) and 
-                                            (len(value.shape) > 1 or value.shape[0] > 1)):
-                                            dtype.append((name, numpy.float64, value.shape))
-                                        else:
-                                            dtype.append((name, numpy.float64))
-                                    data[f"dist_m{D1.index}"] = numpy.zeros(1, dtype=numpy.dtype(dtype))
-                                    data[f"dist_m{D1.index}"]['name'] = D1.name
-                                    data[f"dist_m{D1.index}"]['label'] = D1.label
-                                    data[f"dist_m{D1.index}"]['fixed'] = D1.fixed
-                                    for name, value in params.items():
-                                        data[f"dist_m{D1.index}"][name] = value
+                        data[f"dist_{D.index}"] = self.dist_to_array(D)
+                    if D.name.endswith('Mixture'):
+                        for k, D1 in enumerate(D.distributions):
+                            if f"dist_{D1.index}" not in data:
+                                data[f"dist_{D1.index}"] = self.dist_to_array(D1)
         dist_map = numpy.array(dist_map,
             numpy.dtype([('state', numpy.int32), ('dist', numpy.int32),
-                         ('node', numpy.int32), ('index', numpy.int32),
-                         ('mix', numpy.int32)]))
-
+                         ('node', numpy.int32), ('index', numpy.int32)]))
         data['distribution_mapping'] = dist_map
         state_names = [self.root.states[x].label for x in range(self.num_states)]
         data['state_names'] = numpy.array(
@@ -585,6 +590,29 @@ class Tree():
         data['tree'] = numpy.array(pairs, f"<U{maxlen}")
         numpy.savez(fname, **data)
         return
+
+    def dist_to_array(self, dist):
+        params = dist.get_parameters()
+        dtype = [('name', f'<U{len(dist.name)}'),
+                 ('label', f'<U{len(dist.label)}'),
+                 ('fixed', bool)]
+        for name, value in params.items():
+            if isinstance(value, list):
+                continue
+            if (isinstance(value, numpy.ndarray) and 
+                (len(value.shape) > 1 or value.shape[0] > 1)):
+                dtype.append((name, numpy.float64, value.shape))
+            else:
+                dtype.append((name, numpy.float64))
+        data = numpy.zeros(1, dtype=numpy.dtype(dtype))
+        data['name'] = dist.name
+        data['label'] = dist.label
+        data['fixed'] = dist.fixed
+        for name, value in params.items():
+            if isinstance(value, list):
+                continue
+            data[name] = value
+        return data
 
     def load(self, fname):
         temp = numpy.load(fname)
@@ -614,67 +642,30 @@ class Tree():
         num_nodes = len(node_names)
         distributions = {}
         for name in temp.keys():
-            if not name.startswith('dist_m'):
-                continue
-            params = {}
-            for name2 in temp[name].dtype.names:
-                if name2 == 'name':
-                    dname = temp[name][name2][0]
-                elif name2 == 'label':
-                    label = temp[name][name2][0]
-                elif name2 == 'fixed':
-                    fixed = temp[name][name2][0]
-                else:
-                    if len(temp[name][name2].shape) == 1:
-                        params[name2] = temp[name][name2][0]
-                    else:
-                        params[name2] = temp[name][name2][0, :]
-            if dname == "Zero":
-                distributions[f"{name}"] = dists[dname](label=label)
-            else:
-                distributions[f"{name}"] = dists[dname](label=label, fixed=fixed, **params)
-        for name in temp.keys():
             if not name.startswith('dist_'):
                 continue
-            if name.startswith('dist_m'):
-                continue
             params = {}
             for name2 in temp[name].dtype.names:
                 if name2 == 'name':
                     dname = temp[name][name2][0]
-                elif name2 == 'label':
-                    label = temp[name][name2][0]
-                elif name2 == 'fixed':
-                    fixed = temp[name][name2][0]
-                else:
+                elif isinstance(temp[name][name2], numpy.ndarray):
                     if len(temp[name][name2].shape) == 1:
                         params[name2] = temp[name][name2][0]
                     else:
                         params[name2] = temp[name][name2][0, :]
-            if dname == "Zero":
-                distributions[f"{name}"] = dists[dname]()
-            elif not dname.endswith("Mixture"):
-                distributions[f"{name}"] = dists[dname](label=label, fixed=fixed, **params)
-            else:
-                idx = int(name.split('_')[-1])
-                state_idx, dist_idx, node_idx, idx, _ = dist_map[numpy.where(numpy.logical_and(
-                    dist_map['index'] == idx, dist_map['mix'] == -1))[0][0]]
-                indices = dist_map['mix'][numpy.where(numpy.logical_and(
-                    dist_map['index'] == idx, dist_map['mix'] != -1))]
-                distributions[name] = dists[dname](
-                    [distributions[f"dist_m{x}"] for x in indices],
-                    **params)
-            distributions[f"{name}"].label = label
-            distributions[f"{name}"].fixed = fixed
+                else:
+                    params[name2] = temp[name][name2]
+            distributions[f"{name}"] = dists[dname](**params)
             distributions[f"{name}"].index = int(name.split('_')[-1])
         emissions = [[[None for y in range(numpy.amax(dist_map['dist']) + 1)]
                      for x in range(num_states)] for z in range(num_nodes)]
-        for s_idx, d_idx, n_idx, idx, mix in dist_map:
-            if mix != -1:
-                continue
-            emissions[n_idx][s_idx][d_idx] = distributions[f"dist_{idx}"]
-        self.num_dists = numpy.unique(dist_map['index']).shape[0]
-        self.num_mixdists = numpy.unique(dist_map['mix'][numpy.where(dist_map['mix'] != -1)]).shape[0]
+        for s_idx, d_idx, n_idx, idx in dist_map:
+            D = distributions[f"dist_{idx}"]
+            emissions[n_idx][s_idx][d_idx] = D
+            if D.name.endswith('Mixture'):
+                mixdists = [distributions[f"dist_{x}"] for x in D.distribution_indices]
+                D.distributions = mixdists
+        self.num_dists = len(distributions)
         self.load_tree(tree)
         self.num_states = num_states
         transitions = TransitionMatrix(transition_matrix=transition_matrix,

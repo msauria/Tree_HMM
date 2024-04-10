@@ -27,6 +27,7 @@ class TransitionMatrix():
         where = numpy.where(self.transition_id < 0)
         self.transition_matrix[where] = 0
         self.transition_matrix /= numpy.sum(self.transition_matrix, axis=1, keepdims=True)
+        self.transmatsum = numpy.cumsum(self.transition_matrix, axis=1)
         self.log_transition_matrix = numpy.zeros_like(self.transition_matrix)
         self.log_transition_matrix.fill(-numpy.inf)
         where = numpy.where(self.transition_matrix > 0)
@@ -48,12 +49,17 @@ class TransitionMatrix():
         return
 
     @classmethod
-    def update_tallies(self, *args):
-        s, e, pairs, node_children, transitions, smm_map = args
+    def find_tallies(cls, **kwargs):
+        start = kwargs['start']
+        end = kwargs['end']
+        transitions = kwargs['transitions']
+        node_pairs = kwargs['node_pairs']
+        node_children = kwargs['node_children']
+        smm_map = kwargs['smm_map']
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
+        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['probs']))
         probs = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
                               buffer=views[-1].buf)
@@ -67,26 +73,33 @@ class TransitionMatrix():
         scale = numpy.ndarray((num_seqs, num_nodes), numpy.float64,
                               buffer=views[-1].buf)
         tallies = numpy.zeros((num_states, num_states), numpy.float64)
-        for idx1, idx2 in pairs:
+        for idx1, idx2 in node_pairs:
             children = node_children[idx1]
             if len(children) == 0:
-                tmpreverse = probs[s:e, :, idx1] - scale[s:e, idx1].reshape(-1, 1)
+                tmpreverse = (probs[start:end, :, idx1] -
+                              scale[start:end, idx1].reshape(-1, 1))
             elif len(children) == 1:
-                tmpreverse = (probs[s:e, :, idx1] - scale[s:e, idx1].reshape(-1, 1) +
-                              reverse[s:e, :, children[0]])
+                tmpreverse = (probs[start:end, :, idx1] -
+                              scale[start:end, idx1].reshape(-1, 1) +
+                              reverse[start:end, :, children[0]])
             else:
-                tmpreverse = (probs[s:e, :, idx1] - scale[s:e, idx1].reshape(-1, 1) +
-                              numpy.sum(reverse[s:e, :, children], axis=2))
-            xi = (forward[s:e, :, idx2].reshape(-1, num_states, 1) +
+                tmpreverse = (probs[start:end, :, idx1] -
+                              scale[start:end, idx1].reshape(-1, 1) +
+                              numpy.sum(reverse[start:end, :, children], axis=2))
+            xi = (forward[start:end, :, idx2].reshape(-1, num_states, 1) +
                   tmpreverse.reshape(-1, 1, num_states) +
                   transitions.reshape(1, num_states, num_states))
-            xi -= numpy.amax(xi.reshape(e - s, -1), axis=1).reshape(-1, 1, 1)
+            xi -= numpy.amax(xi.reshape(end - start, -1), axis=1).reshape(-1, 1, 1)
             xi = numpy.exp(xi)
             xi /= numpy.sum(numpy.sum(xi, axis=2), axis=1).reshape(-1, 1, 1)
             tallies += numpy.sum(xi, axis=0)
         for V in views:
             V.close()
         return tallies.reshape(-1)
+
+    def update_tallies(self, tallies):
+        self.tallies += tallies
+        return
 
     def apply_tallies(self):
         if self.updated:
@@ -102,6 +115,7 @@ class TransitionMatrix():
             self.transition_id[self.valid_trans]]
         self.transition_matrix /= numpy.sum(self.transition_matrix, axis=1,
                                             keepdims=True)
+        self.transmatsum = numpy.cumsum(self.transition_matrix, axis=1)
         where = numpy.where(self.transition_matrix > 0)
         self.log_transition_matrix.fill(-numpy.inf)
         self.log_transition_matrix[where] = numpy.log(self.transition_matrix[where])
@@ -120,8 +134,7 @@ class TransitionMatrix():
         return output
 
     def generate_transition(self, state, RNG):
-        return numpy.searchsorted(numpy.cumsum(
-            self.transition_matrix[state, :]), RNG.random())
+        return numpy.searchsorted(self.transmatsum[state, :], RNG.random())
 
 
 

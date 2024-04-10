@@ -32,19 +32,6 @@ class State():
             self.distributions[i].clear_tallies()
         return
 
-    def update_tallies(self, obs, total):
-        names = obs.dtype.names
-        for i in range(self.num_distributions):
-            if not self.distributions[i].fixed:
-                self.distributions[i].update_tallies(obs[names[i]], total)
-        return
-
-    def apply_tallies(self):
-        for i in range(self.num_distributions):
-            if not self.distributions[i].fixed:
-                self.distributions[i].apply_tallies()
-        return
-
     def print(self, level=0):
         output = []
         output.append(f"{' '*level}State {self.index} {self.label}")

@@ -21,6 +21,7 @@ class InitialProbability():
             else:
                 self.initial_mapping = numpy.arange(num_states)
         self.initial_probabilities /= numpy.sum(self.initial_probabilities)
+        self.initprobsum = numpy.cumsum(self.initial_probabilities)
         self.initial_logprobs = numpy.full(num_states, -numpy.inf, numpy.float64)
         where = numpy.where(self.initial_probabilities > 0)[0]
         self.initial_logprobs[where] = numpy.log(self.initial_probabilities[where])
@@ -55,6 +56,7 @@ class InitialProbability():
         self.initial_probabilities.fill(0)
         self.initial_probabilities[where] = tmp[self.initial_mapping[where]]
         self.initial_probabilities /= numpy.sum(self.initial_probabilities)
+        self.initprobsum = numpy.cumsum(self.initial_probabilities)
         where = numpy.where(self.initial_probabilities > 0)[0]
         self.initial_logprobs.fill(-numpy.inf)
         self.initial_logprobs[where] = numpy.log(self.initial_probabilities[where])

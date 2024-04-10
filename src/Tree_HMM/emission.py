@@ -7,7 +7,7 @@ import scipy.stats
 class EmissionDistribution():
     """Base class for hmm emission distributions"""
 
-    def __init__(self, label=''):
+    def __init__(self, label='', **kwargs):
         self.name = "Base"
         self.fixed = False
         self.label = str(label)
@@ -21,8 +21,11 @@ class EmissionDistribution():
         return
 
     @classmethod
-    def update_tallies(self, **kwargs):
+    def find_tallies(cls, **kwargs):
         return kwargs['func'](**kwargs)
+
+    def update_tallies(self, tallies):
+        return
 
     def print(self, level=0):
         return f"{' '*level}Base emission distribution {self.label}"
@@ -33,6 +36,7 @@ class EmissionDistribution():
 
 class EmissionDiscreteDistribution(EmissionDistribution):
     """Discrete hmm emission distribtion"""
+    dtype = numpy.int32
 
 class EmissionAlphabetDistribution(EmissionDiscreteDistribution):
     """Alphabet-based hmm emission distribution"""
@@ -390,6 +394,7 @@ class EmissionDiscreteMixtureDistribution(EmissionDiscreteDistribution):
 
 class EmissionContinuousDistribution(EmissionDistribution):
     """Continuous-based hmm emission distribution"""
+    dtype = numpy.float64
 
 
 class EmissionGaussianDistribution(EmissionContinuousDistribution):
@@ -397,7 +402,7 @@ class EmissionGaussianDistribution(EmissionContinuousDistribution):
     pdf_constant = (numpy.pi * 2) ** -0.5
     log_pdf_constant = numpy.log(numpy.pi * 2) * -0.5
 
-    def __init__(self, mu=None, sigma=None, RNG=None, fixed=False, label=""):
+    def __init__(self, mu=None, sigma=None, RNG=None, fixed=False, label="", **kwargs):
         self.name = "Gaussian"
         if RNG is None:
             RNG = numpy.random.default_rng()
@@ -415,7 +420,6 @@ class EmissionGaussianDistribution(EmissionContinuousDistribution):
         self.fixed = bool(fixed)
         self.label = str(label)
         self.updated = False
-        self.dtype = numpy.float64
         return
 
     def score_observations(self, obs, **kwargs):
@@ -427,20 +431,20 @@ class EmissionGaussianDistribution(EmissionContinuousDistribution):
         return prob
 
     @classmethod
-    def update_tallies(self, **kwargs):
+    def find_tallies(cls, **kwargs):
         smm_map = kwargs['smm_map']
         params = kwargs['params']
         obsDtype = kwargs['obsDtype']
         node_name = kwargs['node_name']
+        node_idx = kwargs['node_idx']
         state_idx = kwargs['state_idx']
         dist_idx = kwargs['dist_idx']
-        mix_idx = kwargs['mix_idx']
         start = kwargs['start']
         end = kwargs['end']
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
+        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_states, num_seqs = sizes
         views.append(SharedMemory(smm_map['obs']))
         obs = numpy.ndarray((num_seqs, num_nodes,), dtype=obsDtype,
                             buffer=views[-1].buf)
@@ -449,36 +453,26 @@ class EmissionGaussianDistribution(EmissionContinuousDistribution):
                               buffer=views[-1].buf)
         mu = params['mu']
         names = obsDtype.names
-        tallies = numpy.zeros(3, numpy.float64)
-        if mix_idx is None:
-            tallies[0] += numpy.sum(
-                obs[names[dist_idx]][start:end, node_idx] *
-                total[start:end, state_idx, node_idx])
-            tallies[1] += numpy.sum(
-                (obs[names[dist_idx]][start:end, node_idx] - mu) ** 2 *
-                total[start:end, state_idx, node_idx])
-            tallies[2] += numpy.sum(
-                total[start:end, state_idx, node_idx])
-        else:
-            mix_indices = kwargs['mix_indices']
-            views.append(SharedMemory(smm_map['mix_probs']))
-            mix_probs = numpy.ndarray((num_seqs, num_mixdists), numpy.float64,
-                                  buffer=views[-1].buf)
-            proportions = params['proportions']
-            mix_proportions = numpy.exp(mix_probs[start:end, mix_indices] -
-                                        numpy.amax(mix_probs[start:end, mix_indices],
-                                                   axis=1, keepdims=True))
-            mix_proportions *= proportions.reshape(1, -1)
-            mix_proportions /= numpy.sum(mix_proportions, axis=1, keepdim=True)
-            probs = total[start:end, state_idx, node_idx] * mix_proportions[:, mix_idx]
-            tallies[0] += numpy.sum(
-                obs[names[dist_idx]][start:end, node_idx] * probs)
-            tallies[1] += numpy.sum(
-                (obs[names[dist_idx]][start:end, node_idx] - mu) ** 2 * probs)
-            tallies[2] += numpy.sum(probs)
+        tallies = EmissionGaussianDistribution.get_tallies(
+            mu, obs[names[dist_idx]][start:end, node_idx],
+            total[start:end, state_idx, node_idx])
         for V in views:
             V.close()
-        return node_name, state_idx, dist_idx, mix_idx, tallies
+        return node_name, state_idx, dist_idx, tallies
+
+    @classmethod
+    def get_tallies(cls, mu, obs, probs, **kwargs):
+        tallies = numpy.zeros(3, numpy.float64)
+        tallies[0] += numpy.sum(
+            obs * probs)
+        tallies[1] += numpy.sum(
+            (obs - mu) ** 2 * probs)
+        tallies[2] += numpy.sum(probs)
+        return tallies
+
+    def update_tallies(self, tallies):
+        self.tallies += tallies
+        return
 
     def apply_tallies(self):
         if self.updated:
@@ -693,20 +687,22 @@ class EmissionZeroDistribution(EmissionContinuousDistribution):
         return
 
     def score_observations(self, obs, **kwargs):
-        start = kwargs['start']
-        end = kwargs['end']
         prob = numpy.full(obs.shape[0], -numpy.inf, numpy.float64)
         prob[numpy.where(obs == 0)] = 0
         return prob
 
     @classmethod
-    def update_tallies(self, **kwargs):
+    def find_tallies(cls, **kwargs):
         node_name = kwargs['node_name']
         state_idx = kwargs['state_idx']
         dist_idx = kwargs['dist_idx']
         mix_idx = kwargs['mix_idx']
         tallies = numpy.zeros(0, numpy.float64)
         return node_name, state_idx, dist_idx, mix_idx, tallies
+
+    @classmethod
+    def get_tallies(cls, **kwargs):
+        return numpy.zeros(0, numpy.float64)
 
     def apply_tallies(self):
         if self.updated:
@@ -727,12 +723,16 @@ class EmissionZeroDistribution(EmissionContinuousDistribution):
 class EmissionContinuousMixtureDistribution(EmissionContinuousDistribution):
     """Combination of multiple continuous emission distributions"""
 
-    def __init__(self, distributions, proportions=None, RNG=None, fixed=False, label=""):
+    def __init__(self, distributions=None, proportions=None, RNG=None, fixed=False, label="", distribution_indices=None, **kwargs):
         self.name = "ContinuousMixture"
         if RNG is None:
             RNG = numpy.random.default_rng()
-        for D in distributions:
-            assert issubclass(type(D), EmissionContinuousDistribution)
+        assert distributions is not None or proportions is not None
+        if distributions is not None:
+            for D in distributions:
+                assert issubclass(type(D), EmissionContinuousDistribution)
+        else:
+            distributions = [EmissionDistribution() for x in range(len(proportions))]
         self.distributions = distributions
         if not proportions is None:
             assert len(distributions) == len(proportions)
@@ -742,7 +742,12 @@ class EmissionContinuousMixtureDistribution(EmissionContinuousDistribution):
         self.proportions /= numpy.sum(self.proportions)
         self.log_proportions = numpy.log(self.proportions)
         self.num_distributions = len(self.distributions)
-        self.distribution_indices = []
+        if distribution_indices is not None:
+            self.distribution_indices = numpy.array(distribution_indices,
+                                                    numpy.int32)
+        else:
+            self.distribution_indices = numpy.full(self.num_distributions, -1,
+                                                   numpy.int32)
         self.index = None
         self.tallies = numpy.zeros(self.num_distributions, numpy.float64)
         self.fixed = bool(fixed)
@@ -753,15 +758,19 @@ class EmissionContinuousMixtureDistribution(EmissionContinuousDistribution):
     def score_observations(self, obs, **kwargs):
         start = kwargs['start']
         end = kwargs['end']
+        smm_map = kwargs['smm_map']
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
-        views.append(SharedMemory(smm_map['mix_probs']))
-        mix_probs = numpy.ndarray((num_seqs, num_mixdists), numpy.float64,
-                                  buffer=views[-1].buf)
-        probs = scipy.special.logsumexp(mix_probs[start:end, self.distribution_indices] +
-                                        self.log_proportions.reshape(-1, 1), axis=1)
+        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_states, num_seqs = sizes
+        views.append(SharedMemory(smm_map['dist_probs']))
+        dist_probs = numpy.ndarray((num_seqs, num_dists), numpy.float64,
+                                    buffer=views[-1].buf)
+        for i, mix_idx in enumerate(self.distribution_indices):
+            dist_probs[start:end, mix_idx] = (
+                self.distributions[i].score_observations(obs, **kwargs))
+        probs = scipy.special.logsumexp(dist_probs[start:end, self.distribution_indices] +
+                                        self.log_proportions.reshape(1, -1), axis=1)
         for V in views:
             V.close()
         return probs
@@ -773,33 +782,57 @@ class EmissionContinuousMixtureDistribution(EmissionContinuousDistribution):
         return
 
     @classmethod
-    def update_tallies(self, **kwargs):
+    def find_tallies(cls, **kwargs):
         smm_map = kwargs['smm_map']
         params = kwargs['params']
+        obsDtype = kwargs['obsDtype']
         node_name = kwargs['node_name']
+        node_idx = kwargs['node_idx']
         state_idx = kwargs['state_idx']
         dist_idx = kwargs['dist_idx']
-        mix_idx = kwargs['mix_idx']
         start = kwargs['start']
         end = kwargs['end']
         proportions = params['proportions']
-        dist_indices = params['dist_indices']
+        dist_indices = params['distribution_indices']
+        dist_params = params['distribution_parameters']
+
         views = []
         views.append(SharedMemory(smm_map['sizes']))
-        sizes = numpy.ndarray(5, numpy.int64, buffer=views[-1].buf)
-        num_nodes, num_dists, num_mixdists, num_states, num_seqs = sizes
-        views.append(SharedMemory(smm_map['mix_probs']))
-        mix_probs = numpy.ndarray((num_seqs, num_mixdists), numpy.float64,
+        sizes = numpy.ndarray(4, numpy.int64, buffer=views[-1].buf)
+        num_nodes, num_dists, num_states, num_seqs = sizes
+        views.append(SharedMemory(smm_map['dist_probs']))
+        dist_probs = numpy.ndarray((num_seqs, num_dists), numpy.float64,
                               buffer=views[-1].buf)
-        mix_proportions = numpy.exp(mix_probs[start:end, dist_indices] -
-                                    numpy.amax(mix_probs[start:end, dist_indices],
+        views.append(SharedMemory(smm_map['obs']))
+        obs = numpy.ndarray((num_seqs, num_nodes,), dtype=obsDtype,
+                            buffer=views[-1].buf)
+        views.append(SharedMemory(smm_map['total']))
+        total = numpy.ndarray((num_seqs, num_states, num_nodes), numpy.float64,
+                              buffer=views[-1].buf)
+
+        mix_probs = numpy.exp(dist_probs[start:end, dist_indices] -
+                              numpy.amax(dist_probs[start:end, dist_indices],
                                                axis=1, keepdims=True))
-        mix_proportions *= proportions.reshape(1, -1)
-        mix_proportions /= numpy.sum(mix_proportions, axis=1, keepdim=True)
-        tallies = numpy.sum(mix_proportions, axis=0)
+        mix_probs *= proportions.reshape(1, -1)
+        mix_probs /= numpy.sum(mix_probs, axis=1, keepdims=True)
+        mix_probs *= total[start:end, state_idx, node_idx].reshape(-1, 1)
+
+        tallies = numpy.sum(mix_probs, axis=0)
+        dist_tallies = []
+        names = obsDtype.names
+        for i, mix_idx in enumerate(dist_indices):
+            dist_tallies.append(dist_params[i][0](
+                obs=obs[names[dist_idx]][start:end, node_idx],
+                probs=mix_probs[:, i], **dist_params[i][1]))
         for V in views:
             V.close()
-        return node_name, state_idx, dist_idx, mix_idx, tallies
+        return node_name, state_idx, dist_idx, [tallies, dist_tallies]
+
+    def update_tallies(self, tallies):
+        self.tallies += tallies[0]
+        for i, mix_tallies in enumerate(self.distribution_indices):
+            self.distributions[i].update_tallies(tallies[1][i])
+        return
 
     def apply_tallies(self):
         for D in self.distributions:
@@ -825,7 +858,10 @@ class EmissionContinuousMixtureDistribution(EmissionContinuousDistribution):
             self.proportions), RNG.random())].generate_emission(RNG)
 
     def get_parameters(self, **kwargs):
-        return {'proportions': self.proportions}#, [D.get_parameters() for D in self.distributions]
+        return {'proportions': self.proportions,
+                'distribution_indices': self.distribution_indices,
+                'distribution_parameters': [
+                    (D.get_tallies, D.get_parameters()) for D in self.distributions]}
 
 
 
