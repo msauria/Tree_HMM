@@ -264,7 +264,7 @@ class Tree():
                     for S in N.states:
                         S.distributions[i].fixed = True
                         S.distributions[i].updated = True
-                        self.dist_probs[:, S.distributions[i].index, idx] = 1
+                        self.dist_probs[:, S.distributions[i].index] = 1
         prev_prob = 1
         for i in range(iterations):
             prob = self.update_model()
